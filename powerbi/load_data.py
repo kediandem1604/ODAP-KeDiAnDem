@@ -38,13 +38,20 @@ load_dotenv(find_dotenv())
 HDFS_NAMENODE = os.getenv("HDFS_NAMENODE_URL", "hdfs://localhost:9000")
 HDFS_HOST = os.getenv("HDFS_WEB_HOST", "localhost:9870")
 HDFS_USER = os.getenv("HDFS_USER", "panda")
-FOLDER_HDFS_PATH = os.getenv("HDFS_COMPACTED_PATH", "/credit_card_data/compacted/")
+FOLDER_HDFS_PATH = os.getenv("HDFS_COMPACTED_PATH", "/credit_card_data/compacted")
+# Đảm bảo có dấu / ở cuối
+if not FOLDER_HDFS_PATH.endswith('/'):
+    FOLDER_HDFS_PATH += '/'
 
 # Power BI Push URL - Cần cập nhật sau khi tạo dataset trên Power BI
 PUSH_URL = os.getenv("POWERBI_PUSH_URL", "")
 
 # File lưu timestamp lần push cuối
 LAST_PUSH_FILE = os.getenv("LAST_PUSH_FILE", "/tmp/last_push_time.txt")
+
+# Tùy chọn: Chỉ push các cột cơ bản (nếu dataset chưa có các cột tính toán)
+# Lưu ý: Push Dataset (Streaming) KHÔNG THỂ tạo calculated columns, phải push từ Python
+PUSH_BASIC_COLUMNS_ONLY = os.getenv("PUSH_BASIC_COLUMNS_ONLY", "false").lower() == "true"
 
 # Khởi tạo HDFS client
 HDFS_CLIENT = InsecureClient(f'http://{HDFS_HOST}', user=HDFS_USER)
@@ -113,6 +120,17 @@ def create_event_time(row):
         if "event_time" in row and pd.notna(row["event_time"]):
             return pd.to_datetime(row["event_time"], utc=True)
         
+        # Nếu có Year, Month, Day, Time (từ CSV gốc)
+        if "Year" in row and "Month" in row and "Day" in row and "Time" in row:
+            year = str(row["Year"]).strip()
+            month = str(row["Month"]).strip().zfill(2)
+            day = str(row["Day"]).strip().zfill(2)
+            time_str = str(row["Time"]).strip()
+            
+            # Tạo datetime string: yyyy-mm-ddTHH:MM:SS
+            datetime_str = f"{year}-{month}-{day}T{time_str}"
+            return pd.to_datetime(datetime_str, utc=True)
+        
         # Nếu có Transaction_Date và Transaction_Time
         if "Transaction_Date" in row and "Transaction_Time" in row:
             date_str = str(row["Transaction_Date"])
@@ -128,16 +146,29 @@ def create_event_time(row):
         # Nếu có Date&Time
         if "Date&Time" in row and pd.notna(row["Date&Time"]):
             return pd.to_datetime(row["Date&Time"], utc=True)
-    except:
+    except Exception as e:
+        # Debug: In lỗi nếu cần
         pass
     return None
 
+# Debug: In các cột có trong CSV
+print(f"\n📋 Các cột trong CSV: {list(df.columns)}")
+
 df["event_time"] = df.apply(create_event_time, axis=1)
+
+# Debug: Kiểm tra event_time
+print(f"📊 Tổng số dòng: {len(df)}")
+print(f"📊 Số dòng có event_time hợp lệ: {df['event_time'].notna().sum()}")
+print(f"📊 Số dòng không có event_time: {df['event_time'].isna().sum()}")
+
+if df['event_time'].notna().sum() > 0:
+    print(f"📊 event_time min: {df[df['event_time'].notna()]['event_time'].min()}")
+    print(f"📊 event_time max: {df[df['event_time'].notna()]['event_time'].max()}")
 
 # Lọc dữ liệu mới hơn timestamp cuối (bỏ qua các dòng không có event_time hợp lệ)
 df_filtered = df[(df["event_time"].notna()) & (df["event_time"] > last_push_time)].copy()
 
-print(f"Số dòng mới cần push: {len(df_filtered)}")
+print(f"\n📊 Số dòng mới cần push: {len(df_filtered)}")
 
 if len(df_filtered) == 0:
     print("Không có dữ liệu mới để push.")
@@ -167,8 +198,17 @@ for _, row in df_filtered.iterrows():
                     if isinstance(dt, pd.Timestamp):
                         dt = dt.to_pydatetime()
         
-        # Amount - lấy từ Amount hoặc Amount_VND
-        amount = float(row.get("Amount", row.get("Amount_VND", 0))) if pd.notna(row.get("Amount", row.get("Amount_VND", 0))) else 0.0
+        # Amount - lấy từ Amount hoặc Amount_VND, xử lý dấu $ và dấu phẩy
+        amount_str = str(row.get("Amount", row.get("Amount_VND", 0))).strip()
+        if amount_str and pd.notna(row.get("Amount", row.get("Amount_VND", 0))):
+            # Xóa dấu $, dấu phẩy, và khoảng trắng
+            amount_str = amount_str.replace('$', '').replace(',', '').strip()
+            try:
+                amount = float(amount_str)
+            except:
+                amount = 0.0
+        else:
+            amount = 0.0
         
         # Merchant Name
         merchant_name = str(row.get("Merchant Name", row.get("Merchant_Name", ""))) if pd.notna(row.get("Merchant Name", row.get("Merchant_Name", ""))) else ""
@@ -182,6 +222,14 @@ for _, row in df_filtered.iterrows():
         # Is Fraud? - lấy từ Is Fraud? hoặc Is Fraud
         is_fraud = str(row.get("Is Fraud?", row.get("Is Fraud", ""))) if pd.notna(row.get("Is Fraud?", row.get("Is Fraud", ""))) else ""
         
+        # TxnDate và Hour - luôn thêm (không phụ thuộc PUSH_BASIC_COLUMNS_ONLY)
+        if dt:
+            txn_date = dt.date().isoformat()
+            hour = dt.hour
+        else:
+            txn_date = ""
+            hour = 0
+        
         # Tạo row với các trường cơ bản
         row_data = {
             "User": user,
@@ -190,47 +238,43 @@ for _, row in df_filtered.iterrows():
             "Merchant Name": merchant_name,
             "Merchant City": merchant_city,
             "Errors?": errors,
-            "Is Fraud?": is_fraud
+            "Is Fraud?": is_fraud,
+            "TxnDate": txn_date,  # Luôn thêm TxnDate
+            "Hour": hour          # Luôn thêm Hour
         }
         
-        # Thêm các cột tính toán nếu có datetime hợp lệ
-        if dt:
-            # TxnDate (YYYY-MM-DD)
-            row_data["TxnDate"] = dt.date().isoformat()
+        # Thêm các cột tính toán khác nếu có datetime hợp lệ (chỉ khi không dùng basic mode)
+        if not PUSH_BASIC_COLUMNS_ONLY:
+            if dt:
+                # TimeBucket60Min (YYYY-MM-DDTHH:00:00Z)
+                row_data["TimeBucket60Min"] = to_iso_z(bucket_minutes(dt, 60))
+                
+                # TimeBucket2H (YYYY-MM-DDTHH:00:00Z, làm tròn xuống mỗi 2 giờ)
+                row_data["TimeBucket2H"] = to_iso_z(bucket_2h(dt))
+                
+                # DayOfWeekNum (0=Monday, 6=Sunday) - Python weekday: 0=Monday, 6=Sunday
+                row_data["DayOfWeekNum"] = dt.weekday()
+                
+                # DayOfWeekName (tên thứ trong tuần)
+                day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
+                row_data["DayOfWeekName"] = day_names[dt.weekday()]
+                
+                # IsWeekend (1 nếu là cuối tuần, 0 nếu không)
+                row_data["IsWeekend"] = 1 if dt.weekday() >= 5 else 0
+            else:
+                # Nếu không có datetime hợp lệ, để giá trị mặc định cho các cột khác
+                # (TxnDate và Hour đã được thêm vào row_data cơ bản)
+                row_data["TimeBucket60Min"] = ""
+                row_data["TimeBucket2H"] = ""
+                row_data["DayOfWeekNum"] = 0
+                row_data["DayOfWeekName"] = ""
+                row_data["IsWeekend"] = 0
             
-            # Hour (0-23)
-            row_data["Hour"] = dt.hour
+            # HasErrorFlag (1 nếu có lỗi, 0 nếu không)
+            row_data["HasErrorFlag"] = 1 if errors and str(errors).strip().lower() not in ["", "no", "none", "false"] else 0
             
-            # TimeBucket60Min (YYYY-MM-DDTHH:00:00Z)
-            row_data["TimeBucket60Min"] = to_iso_z(bucket_minutes(dt, 60))
-            
-            # TimeBucket2H (YYYY-MM-DDTHH:00:00Z, làm tròn xuống mỗi 2 giờ)
-            row_data["TimeBucket2H"] = to_iso_z(bucket_2h(dt))
-            
-            # DayOfWeekNum (0=Monday, 6=Sunday) - Python weekday: 0=Monday, 6=Sunday
-            row_data["DayOfWeekNum"] = dt.weekday()
-            
-            # DayOfWeekName (tên thứ trong tuần)
-            day_names = ["Monday", "Tuesday", "Wednesday", "Thursday", "Friday", "Saturday", "Sunday"]
-            row_data["DayOfWeekName"] = day_names[dt.weekday()]
-            
-            # IsWeekend (1 nếu là cuối tuần, 0 nếu không)
-            row_data["IsWeekend"] = 1 if dt.weekday() >= 5 else 0
-        else:
-            # Nếu không có datetime hợp lệ, để giá trị mặc định
-            row_data["TxnDate"] = ""
-            row_data["Hour"] = 0
-            row_data["TimeBucket60Min"] = ""
-            row_data["TimeBucket2H"] = ""
-            row_data["DayOfWeekNum"] = 0
-            row_data["DayOfWeekName"] = ""
-            row_data["IsWeekend"] = 0
-        
-        # HasErrorFlag (1 nếu có lỗi, 0 nếu không)
-        row_data["HasErrorFlag"] = 1 if errors and str(errors).strip().lower() not in ["", "no", "none", "false"] else 0
-        
-        # IsFraudFlag (1 nếu là fraud, 0 nếu không)
-        row_data["IsFraudFlag"] = 1 if is_fraud and str(is_fraud).strip().lower() in ["yes", "true", "1"] else 0
+            # IsFraudFlag (1 nếu là fraud, 0 nếu không)
+            row_data["IsFraudFlag"] = 1 if is_fraud and str(is_fraud).strip().lower() in ["yes", "true", "1"] else 0
         
         rows.append(row_data)
     except Exception as e:
