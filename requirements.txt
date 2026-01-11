@@ -1,0 +1,28 @@
+# Kafka
+confluent-kafka
+# kafka-python  # Uncomment if using the other library, but current code uses confluent-kafka
+
+# Spark
+pyspark
+
+# API & Web Scraping (Exchange Rate)
+requests
+selenium
+beautifulsoup4
+lxml
+
+# Configuration
+python-dotenv
+
+# Utilities
+pandas
+pytz
+
+# HDFS Client (for Power BI integration)
+hdfs
+
+# Power BI integration
+requests
+
+# Workflow (Optional - if running Airflow via pip)
+apache-airflow
